@@ -5,6 +5,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -65,6 +66,29 @@ public class InferenceEngine {
     /** Pairs of contradictory facts detected during the conflict phase. */
     private final List<PairInConflict> conflictiveNodes;
 
+    /**
+     * Propagation mode. {@code true} follows Budán et al. (2017), Definition 8(iii) and
+     * Algorithm 2: the support of a derived fact is computed from the <b>weakened</b>
+     * valuations (δ) of its premises. {@code false} keeps the legacy behaviour of this
+     * engine: support uses the accrued valuations (μ) and conflicts are resolved once,
+     * after the inference fixpoint. Selected with the system property
+     * {@code laf.propagation} or the environment variable {@code LAF_PROPAGATION}
+     * ({@code weakened} | {@code accrued}); the default is {@code weakened}.
+     */
+    private final boolean propagateWeakened;
+    /** Original labels F(X) of the facts given in the program, keyed by {@code name(argument)}. */
+    private final Map<String, String[]> initialLabels;
+    /** Rule applications that derived each fact, keyed by {@code name(argument)} of the conclusion. */
+    private final Map<String, List<Derivation>> derivations;
+
+    /** One rule application: the rule, the literal keys of its premises and the per-rule fact it produced. */
+    private record Derivation(Rule rule, List<String> premiseKeys, Fact ruleFact) {}
+
+    /** Maximum number of Jacobi iterations when relabeling with weakened premises. */
+    private static final int MAX_RELABEL_ITERATIONS = 500;
+    /** Convergence tolerance of the relabeling loop. */
+    private static final double RELABEL_EPSILON = 1e-12;
+
     /** Custom exp4j function exposing Math.min(X, Y) as min(X,Y) in user expressions. */
     private static final Function MIN_FUNCTION = new Function("min", 2) {
         @Override
@@ -99,12 +123,43 @@ public class InferenceEngine {
      * @param functions  A 2D array representing the label algebra
      */
     public InferenceEngine(List<Fact> facts, List<Rule> rules, String[][] functions) {
-        this.edges = new HashMap<>();               
-        this.facts = facts;                         
-        this.rules = rules;                         
-        this.functions = functions;                 
+        this(facts, rules, functions, defaultPropagateWeakened());
+    }
+
+    /**
+     * Creates a new inference engine choosing the propagation mode explicitly.
+     *
+     * @param propagateWeakened {@code true} to propagate the weakened valuations δ of the
+     *                          premises (Budán et al. 2017, Def. 8(iii)); {@code false} for
+     *                          the legacy accrued-valuation propagation.
+     */
+    public InferenceEngine(List<Fact> facts, List<Rule> rules, String[][] functions, boolean propagateWeakened) {
+        this.edges = new HashMap<>();
+        this.facts = facts;
+        this.rules = rules;
+        this.functions = functions;
         this.removableEdges = new ArrayList<>();
         this.conflictiveNodes = new ArrayList<>();
+        this.propagateWeakened = propagateWeakened;
+        this.derivations = new LinkedHashMap<>();
+        this.initialLabels = new LinkedHashMap<>();
+        for (Fact fact : facts) {
+            initialLabels.put(literalKey(fact), fact.getAttributes());
+        }
+    }
+
+    /** Reads the propagation mode from {@code laf.propagation} / {@code LAF_PROPAGATION}; default weakened. */
+    private static boolean defaultPropagateWeakened() {
+        String mode = System.getProperty("laf.propagation");
+        if (mode == null || mode.isBlank()) {
+            mode = System.getenv("LAF_PROPAGATION");
+        }
+        return mode == null || mode.isBlank() || !mode.trim().equalsIgnoreCase("accrued");
+    }
+
+    /** Returns the propagation mode in use. */
+    public boolean isPropagateWeakened() {
+        return propagateWeakened;
     }
 
     /**
@@ -214,7 +269,13 @@ public class InferenceEngine {
         } while (anyNewFact);
         
         conflict(); // Conflicts between facts are resolved
-        
+
+        if (propagateWeakened) {
+            // Budán et al. (2017), Def. 8(iii) / Algorithm 2: recompute every label so that the
+            // support of each conclusion uses the weakened valuations of its premises.
+            relabelWithWeakenedPremises();
+        }
+
         return new ArgumentativeGraph(edges, conflictiveNodes);
     }
     
@@ -246,8 +307,9 @@ public class InferenceEngine {
     private void addFact (List<Fact> potentialFacts, Fact newFact, Rule rule) {
         // Calculate label values 
         newFact.setAttributes( calculateSupport (potentialFacts, rule) );
+        recordDerivation(newFact, rule, potentialFacts, newFact);
         // Add new fact to facts list
-        facts.add(newFact); 
+        facts.add(newFact);
         // Add edge between the activated rule and the new fact.
         if (!edges.containsKey(rule)) {
             edges.put(rule, new ArrayList<>());
@@ -530,6 +592,7 @@ public class InferenceEngine {
         }
 
         newFact.setAttributes(calculateSupport(potentialFacts, rule)); // Calculate the attributes values
+        recordDerivation(newFact, rule, potentialFacts, newFact);
         // Add the edge from the activated rule to the new fact
         if (!edges.containsKey(rule)) {
             edges.put(rule, new ArrayList<>());
@@ -1012,5 +1075,203 @@ public class InferenceEngine {
         }
 
         return attributtes;
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Propagation with weakened premises (Budán et al. 2017, Definition 8(iii), Algorithm 2)
+    // ------------------------------------------------------------------------------------
+
+    /** Literal key {@code name(argument)} used to identify a fact regardless of its object identity. */
+    private static String literalKey(Fact fact) {
+        return fact.getName() + "(" + fact.getArgument() + ")";
+    }
+
+    /** Key of the contradictory literal: {@code p(a)} for {@code ~p(a)} and vice versa. */
+    private static String oppositeKey(Fact fact) {
+        String name = fact.getName();
+        String opposite = name.startsWith("~") ? name.substring(1) : "~" + name;
+        return opposite + "(" + fact.getArgument() + ")";
+    }
+
+    /**
+     * Records that {@code conclusion} was derived by applying {@code rule} to {@code premises}.
+     * Premises are stored by literal key, because the engine may later replace a premise object
+     * by its aggregated version and re-derive the conclusion; a repeated application of the same
+     * rule over the same premises replaces the previous record instead of duplicating it.
+     */
+    private void recordDerivation(Fact conclusion, Rule rule, List<Fact> premises, Fact ruleFact) {
+        List<String> keys = new ArrayList<>();
+        for (Fact premise : premises) {
+            keys.add(literalKey(premise));
+        }
+        List<Derivation> list = derivations.computeIfAbsent(literalKey(conclusion), k -> new ArrayList<>());
+        list.removeIf(d -> d.rule() == rule && d.premiseKeys().equals(keys));
+        list.add(new Derivation(rule, keys, ruleFact));
+    }
+
+    /** Evaluates one binary numeric operator of the algebra and clamps the result to [0, 1]. */
+    private double evaluate(String operator, double x, double y) {
+        double value = new ExpressionBuilder(operator)
+                .variables("X", "Y")
+                .functions(MIN_FUNCTION, MAX_FUNCTION)
+                .build()
+                .setVariable("X", x)
+                .setVariable("Y", y)
+                .evaluate();
+        if (value > 1) {
+            return 1.0;
+        }
+        if (value < 0) {
+            return 0.0;
+        }
+        return value;
+    }
+
+    private static double[] parseLabels(String[] labels) {
+        double[] values = new double[labels.length];
+        for (int i = 0; i < labels.length; i++) {
+            values[i] = Double.parseDouble(labels[i]);
+        }
+        return values;
+    }
+
+    private static String[] formatLabels(double[] values) {
+        String[] labels = new String[values.length];
+        for (int i = 0; i < values.length; i++) {
+            labels[i] = String.valueOf(values[i]);
+        }
+        return labels;
+    }
+
+    /**
+     * Support of one rule application, folded exactly like {@link #calculateSupport}: the first
+     * premise, then each following premise, then the rule label; but using the <b>weakened</b>
+     * valuations δ of the premises. Returns {@code null} when a premise is not (yet) labeled.
+     */
+    private double[] supportFromWeakened(Derivation derivation, Map<String, double[]> delta, int labelCount) {
+        double[] support = new double[labelCount];
+        double[] ruleLabels = parseLabels(derivation.rule().getAttributes());
+        for (int i = 0; i < labelCount; i++) {
+            Double accumulated = null;
+            for (String premiseKey : derivation.premiseKeys()) {
+                double[] premise = delta.get(premiseKey);
+                if (premise == null) {
+                    return null;
+                }
+                accumulated = accumulated == null ? premise[i] : evaluate(functions[i][0], accumulated, premise[i]);
+            }
+            if (accumulated == null) {
+                return null;
+            }
+            support[i] = evaluate(functions[i][0], accumulated, ruleLabels[i]);
+        }
+        return support;
+    }
+
+    /**
+     * Recomputes μ and δ of every fact so that they satisfy the labeling equations of
+     * Budán et al. (2017), Definition 8:
+     * <ul>
+     *   <li>μ(X) = F(X) ⊕ ⊕<sub>s</sub>( ⊙<sub>t</sub> δ(premise<sub>t</sub>) ⊙ rule<sub>s</sub> ) for a fact of the
+     *       program that is also derived; without F(X) for a purely derived fact;
+     *       μ(X) = F(X) for a fact without derivations.</li>
+     *   <li>δ(X) = μ(X) ⊖ μ(∼X) when ∼X exists, otherwise δ(X) = μ(X).</li>
+     * </ul>
+     * The equations are solved by Jacobi iteration starting from the legacy values. For an
+     * acyclic argumentation graph (no blocking conflict cycles) the iteration reaches the
+     * exact solution after at most depth+1 sweeps; with conflict cycles it approximates a
+     * fixed point of the system (the article leaves that case to an external solver).
+     * Qualitative (symbolic) labels are not relabeled: the legacy values are kept.
+     */
+    private void relabelWithWeakenedPremises() {
+        Map<String, Fact> canonical = new LinkedHashMap<>();
+        for (Fact fact : facts) {
+            canonical.put(literalKey(fact), fact);
+        }
+        if (canonical.isEmpty()) {
+            return;
+        }
+        Map<String, double[]> mu = new LinkedHashMap<>();
+        Map<String, double[]> delta = new LinkedHashMap<>();
+        Map<String, double[]> base = new LinkedHashMap<>();
+        int labelCount;
+        try {
+            labelCount = canonical.values().iterator().next().getAttributes().length;
+            for (Map.Entry<String, Fact> entry : canonical.entrySet()) {
+                mu.put(entry.getKey(), parseLabels(entry.getValue().getAttributes()));
+                delta.put(entry.getKey(), parseLabels(entry.getValue().getDeltaAttributes()));
+            }
+            for (Map.Entry<String, String[]> entry : initialLabels.entrySet()) {
+                base.put(entry.getKey(), parseLabels(entry.getValue()));
+            }
+            for (Rule rule : rules) {
+                parseLabels(rule.getAttributes());
+            }
+        } catch (NumberFormatException symbolicLabels) {
+            return; // qualitative algebra: keep the legacy labels
+        }
+
+        for (int iteration = 0; iteration < MAX_RELABEL_ITERATIONS; iteration++) {
+            double maxChange = 0.0;
+            Map<String, double[]> nextMu = new LinkedHashMap<>();
+            for (String key : canonical.keySet()) {
+                double[] current = mu.get(key);
+                double[] next = new double[labelCount];
+                double[] initial = base.get(key);
+                List<Derivation> applications = derivations.getOrDefault(key, List.of());
+                for (int i = 0; i < labelCount; i++) {
+                    Double accumulated = initial == null ? null : initial[i];
+                    for (Derivation derivation : applications) {
+                        double[] support = supportFromWeakened(derivation, delta, labelCount);
+                        if (support == null) {
+                            continue;
+                        }
+                        accumulated = accumulated == null
+                                ? support[i]
+                                : evaluate(functions[i][1], support[i], accumulated);
+                    }
+                    next[i] = accumulated == null ? current[i] : accumulated;
+                    maxChange = Math.max(maxChange, Math.abs(next[i] - current[i]));
+                }
+                nextMu.put(key, next);
+            }
+            Map<String, double[]> nextDelta = new LinkedHashMap<>();
+            for (Map.Entry<String, Fact> entry : canonical.entrySet()) {
+                String key = entry.getKey();
+                String opposite = oppositeKey(entry.getValue());
+                double[] own = nextMu.get(key);
+                double[] other = nextMu.get(opposite);
+                double[] next = new double[labelCount];
+                for (int i = 0; i < labelCount; i++) {
+                    next[i] = other == null ? own[i] : evaluate(functions[i][2], own[i], other[i]);
+                    maxChange = Math.max(maxChange, Math.abs(next[i] - delta.get(key)[i]));
+                }
+                nextDelta.put(key, next);
+            }
+            mu = nextMu;
+            delta = nextDelta;
+            if (maxChange < RELABEL_EPSILON) {
+                break;
+            }
+        }
+
+        for (Map.Entry<String, Fact> entry : canonical.entrySet()) {
+            Fact fact = entry.getValue();
+            fact.setAttributes(formatLabels(mu.get(entry.getKey())));
+            fact.setDeltaAttributes(formatLabels(delta.get(entry.getKey())));
+        }
+        // Per-rule intermediate facts (visible as graph nodes when aggregation occurred).
+        for (Map.Entry<String, List<Derivation>> entry : derivations.entrySet()) {
+            for (Derivation derivation : entry.getValue()) {
+                Fact ruleFact = derivation.ruleFact();
+                if (ruleFact == canonical.get(entry.getKey())) {
+                    continue;
+                }
+                double[] support = supportFromWeakened(derivation, delta, labelCount);
+                if (support != null) {
+                    ruleFact.setAttributes(formatLabels(support));
+                }
+            }
+        }
     }
 }
